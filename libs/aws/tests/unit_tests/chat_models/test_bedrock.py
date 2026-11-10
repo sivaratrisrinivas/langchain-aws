@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages.content import create_file_block, create_image_block
 from langchain_core.runnables import RunnableBinding
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -1501,6 +1502,76 @@ def test__format_anthropic_messages_strips_extra_fields_from_tool_result_text() 
     text_block = tool_result["content"][0]
     assert text_block == {"type": "text", "text": "tool output"}
     assert "id" not in text_block
+
+
+def test_invoke_model_body_tool_result_standard_image_and_file_blocks() -> None:
+    """Repro: standard image/file blocks inside a ToolMessage reach Bedrock raw.
+
+    `langchain.mcp` (and `langchain-mcp-adapters`) build tool results with
+    `create_image_block` / `create_file_block`, which always add an `lc_` id.
+    #870 fixed text blocks inside `tool_result`, but image and file blocks are
+    still forwarded as LangChain blocks, which the Anthropic Messages API on
+    Bedrock rejects. See langchain-ai/langchain#40483.
+    """
+    mocked_client = MagicMock()
+    mock_body = MagicMock()
+    mock_body.read.return_value = json.dumps(
+        {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+    ).encode()
+    mocked_client.invoke_model.return_value = {
+        "body": mock_body,
+        "ResponseMetadata": {"HTTPHeaders": {}},
+    }
+
+    llm = ChatBedrock(
+        client=mocked_client,
+        model_id="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        region_name="us-west-2",
+    )
+
+    image_b64 = "iVBORw0KGgo="
+    pdf_b64 = "JVBERi0xLjQK"
+    messages = [
+        HumanMessage("Read the chart and the report."),  # type: ignore[misc]
+        AIMessage(  # type: ignore[misc]
+            "",
+            tool_calls=[{"name": "fetch_report", "args": {}, "id": "toolu_01"}],
+        ),
+        ToolMessage(  # type: ignore[misc]
+            content=[
+                create_image_block(base64=image_b64, mime_type="image/png"),
+                create_file_block(base64=pdf_b64, mime_type="application/pdf"),
+            ],
+            tool_call_id="toolu_01",
+        ),
+    ]
+    llm.invoke(messages)
+
+    body = json.loads(mocked_client.invoke_model.call_args[1]["body"])
+    tool_result = body["messages"][-1]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result["content"] == [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": image_b64,
+            },
+        },
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": pdf_b64,
+            },
+        },
+    ]
 
 
 def test__convert_messages_to_prompt_anthropic_message_is_none() -> None:
